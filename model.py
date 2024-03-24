@@ -1,8 +1,10 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.autograd import Variable
 from sparsetrans import SparseTransformer
+from mamba_ssm import Mamba
 
 
 class BatchTreeEncoder(nn.Module):
@@ -39,13 +41,13 @@ class BatchTreeEncoder(nn.Module):
         index, children_index = [], []
         current_node, children = [], []
         for i in range(size):
-            if node[i][0] is not -1:
+            if node[i][0] != -1:
                 index.append(i)
                 current_node.append(node[i][0])
                 temp = node[i][1:]
                 c_num = len(temp)
                 for j in range(c_num):
-                    if temp[j][0] is not -1:
+                    if temp[j][0] != -1:
                         if len(children_index) <= j:
                             children_index.append([i])
                             children.append([temp[j]])
@@ -65,7 +67,7 @@ class BatchTreeEncoder(nn.Module):
             if tree is not None:
                 batch_current += zeros.index_copy(0, Variable(self.th.LongTensor(children_index[c])), tree)
         # batch_current = F.tanh(batch_current)
-        batch_index = [i for i in batch_index if i is not -1]
+        batch_index = [i for i in batch_index if i != -1]
         b_in = Variable(self.th.LongTensor(batch_index))
         self.node_list.append(self.batch_node.index_copy(0, b_in, batch_current))
         return batch_current
@@ -97,7 +99,11 @@ class BatchProgramClassifier(nn.Module):
                                         self.batch_size, self.gpu, pretrained_weight)
 
         #transformer
-        self.transformer = SparseTransformer().cuda()
+        #self.encoderlayer = TransformerEncoderLayer(d_model=self.embedding_dim, nhead=4)
+        #self.transformer = TransformerEncoder(self.encoderlayer, num_layers=2)
+        
+        #mamba
+        self.mamba = Mamba(d_model=self.embedding_dim, d_state=128, d_conv=4, expand=2)
 
         # linear
         self.hidden2label = nn.Linear(self.embedding_dim, self.label_size)
@@ -117,8 +123,8 @@ class BatchProgramClassifier(nn.Module):
             return zeros.cuda()
         return zeros
 
-    def forward(self, input):
-        x, y = input[0], input[1]
+    def forward(self, x):
+        #x, y = input[0], input[1]
 
         # encode x
         lens = [len(item) for item in x]
@@ -129,6 +135,7 @@ class BatchProgramClassifier(nn.Module):
             for j in range(lens[i]):
                 encodes.append(x[i][j])
 
+        #encodes = [i.cuda() for i in encodes]
         encodes = self.encoder(encodes, sum(lens))
         seq, start, end = [], 0, 0
         for i in range(self.batch_size):
@@ -139,21 +146,17 @@ class BatchProgramClassifier(nn.Module):
             start = end
         encodes = torch.cat(seq)
         encodes = encodes.view(self.batch_size, max_len, -1)
-
-        # pad y
-        matrix = []
-        for i in range(self.batch_size):
-            pad_size = max_len - len(y[i])
-            matrix.append(F.pad(y[i], (0, pad_size, 0, pad_size), value=1))
-        matrix = torch.stack(matrix, dim=0)
-
-        #transformer
-        output, _ = self.transformer([encodes, matrix])
-        output = torch.transpose(output, 1, 2) # [batch_size, d_model, src_len]
         
-        #pooling
-        output = F.max_pool1d(output, output.size(2)).squeeze(2) # [batch_size, d_model]
+        #transformer
+        #output = self.transformer(encodes.transpose(0, 1)).transpose(0, 1)
 
+        #mamba
+        output = self.mamba(encodes)
+
+        #pooling
+        output = output.permute(0, 2, 1)
+        output = F.max_pool1d(output, output.size(2)).squeeze(2) # [batch_size, d_model]
+        
         # linear
         y = self.hidden2label(output) # [batch_size, label_size]
         return y
